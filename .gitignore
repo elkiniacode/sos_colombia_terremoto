@@ -1,12 +1,15 @@
 node_modules
 .pnpm-store
 .next
+out
+next-env.d.ts
 dist
 .env
 .env.local
 coverage
 *.log
 .DS_Store
+.playwright-mcp/
 
 # Terraform local state/cache/real variable files
 **/.terraform/
