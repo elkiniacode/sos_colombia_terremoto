@@ -30,6 +30,15 @@ services:
       retries: 30
     networks: [backend]
 
+  sync-key-init:
+    image: node:22-alpine
+    restart: "no"
+    command: ["node", "/init/generate-sync-keys.mjs"]
+    volumes:
+      - ./scripts/generate-sync-keys.mjs:/init/generate-sync-keys.mjs:ro
+      - sync_keys:/keys
+    networks: [backend]
+
   minio:
     image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-06T17-38-46Z}
     restart: unless-stopped
@@ -52,15 +61,20 @@ services:
       minio:
         condition: service_healthy
     entrypoint: >-
-      /bin/sh -c '
+      /bin/bash -c '
       set -eu;
+      BUCKET="$${PRIVATE_EVIDENCE_BUCKET}";
+      RETENTION="$${EVIDENCE_RETENTION_DAYS}";
       mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}";
-      mc mb --ignore-existing local/$${PRIVATE_EVIDENCE_BUCKET};
-      mc anonymous set none local/$${PRIVATE_EVIDENCE_BUCKET};
-      mc version enable local/$${PRIVATE_EVIDENCE_BUCKET};
-      sed "s/__BUCKET__/$${PRIVATE_EVIDENCE_BUCKET}/g" /policies/sos-api.json > /tmp/sos-api.json;
-      sed "s/__BUCKET__/$${PRIVATE_EVIDENCE_BUCKET}/g" /policies/evidence-scanner.json > /tmp/evidence-scanner.json;
-      sed "s/__RETENTION_DAYS__/$${EVIDENCE_RETENTION_DAYS}/g" /policies/evidence-lifecycle.json > /tmp/evidence-lifecycle.json;
+      mc mb --ignore-existing "local/$${BUCKET}";
+      mc anonymous set none "local/$${BUCKET}";
+      mc version enable "local/$${BUCKET}";
+      api_policy=$$(cat /policies/sos-api.json);
+      printf "%s" "$${api_policy//__BUCKET__/$${BUCKET}}" > /tmp/sos-api.json;
+      scanner_policy=$$(cat /policies/evidence-scanner.json);
+      printf "%s" "$${scanner_policy//__BUCKET__/$${BUCKET}}" > /tmp/evidence-scanner.json;
+      lifecycle_policy=$$(cat /policies/evidence-lifecycle.json);
+      printf "%s" "$${lifecycle_policy//__RETENTION_DAYS__/$${RETENTION}}" > /tmp/evidence-lifecycle.json;
       mc admin user rm local "$${S3_API_ACCESS_KEY}" >/dev/null 2>&1 || true;
       mc admin user rm local "$${S3_SCANNER_ACCESS_KEY}" >/dev/null 2>&1 || true;
       mc admin policy rm local sos-api >/dev/null 2>&1 || true;
@@ -71,7 +85,7 @@ services:
       mc admin policy create local sos-evidence-scanner /tmp/evidence-scanner.json;
       mc admin policy attach local sos-api --user "$${S3_API_ACCESS_KEY}";
       mc admin policy attach local sos-evidence-scanner --user "$${S3_SCANNER_ACCESS_KEY}";
-      mc ilm rule import local/$${PRIVATE_EVIDENCE_BUCKET} < /tmp/evidence-lifecycle.json;
+      mc ilm rule import "local/$${BUCKET}" < /tmp/evidence-lifecycle.json;
       exit 0'
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
@@ -115,7 +129,8 @@ services:
 
   api:
     build:
-      context: ../../apps/api
+      context: ../..
+      dockerfile: apps/api/Dockerfile
     restart: unless-stopped
     environment:
       NODE_ENV: production
@@ -135,13 +150,26 @@ services:
       AWS_SECRET_ACCESS_KEY: ${S3_API_SECRET_KEY}
       PRIVATE_EVIDENCE_BUCKET: ${PRIVATE_EVIDENCE_BUCKET:-sos-private-evidence}
       EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-90}
-      # ClamAV escribe el mismo tag de contrato que GuardDuty, pero el provider real es local/tagged S3.
       EVIDENCE_MALWARE_SCAN_MODE: TAGGED_S3
       REQUIRE_MALWARE_SCAN: ${REQUIRE_MALWARE_SCAN:-true}
       IDENTITY_HASH_SECRET: ${IDENTITY_HASH_SECRET:?IDENTITY_HASH_SECRET required}
       LIVENESS_PROVIDER: ${LIVENESS_PROVIDER:-MANUAL}
       LIVENESS_MAX_ATTEMPTS_PER_24H: ${LIVENESS_MAX_ATTEMPTS_PER_24H:-3}
-      ALLOW_LEGACY_COMMAND_TOKEN: ${ALLOW_LEGACY_COMMAND_TOKEN:-true}
+      SYNC_KEY_MODE: LOCAL_PEM
+      SYNC_ENCRYPTION_PRIVATE_KEY_PATH: /run/sos-sync-keys/sync-encryption-private.pem
+      SYNC_RECEIPT_SIGNING_PRIVATE_KEY_PATH: /run/sos-sync-keys/sync-receipt-signing-private.pem
+      SYNC_ENCRYPTION_KEY_PUBLIC_ID: ${SYNC_ENCRYPTION_KEY_PUBLIC_ID:-sync-encryption-v1}
+      SYNC_RECEIPT_SIGNING_KEY_PUBLIC_ID: ${SYNC_RECEIPT_SIGNING_KEY_PUBLIC_ID:-sync-receipt-v1}
+      SYNC_MAX_ENVELOPE_TTL_SECONDS: ${SYNC_MAX_ENVELOPE_TTL_SECONDS:-259200}
+      SYNC_MAX_CIPHERTEXT_BYTES: ${SYNC_MAX_CIPHERTEXT_BYTES:-12288}
+      SYNC_MAX_BATCH_SIZE: ${SYNC_MAX_BATCH_SIZE:-4}
+      SYNC_BATCH_REQUESTS_PER_MINUTE: ${SYNC_BATCH_REQUESTS_PER_MINUTE:-30}
+      REUNIFICATION_LOOKUP_KEY_VERSION: ${REUNIFICATION_LOOKUP_KEY_VERSION:-1}
+      REUNIFICATION_LOOKUP_SECRET_B64URL: ${REUNIFICATION_LOOKUP_SECRET_B64URL:-}
+      REUNIFICATION_PREVIOUS_LOOKUP_KEY_VERSION: ${REUNIFICATION_PREVIOUS_LOOKUP_KEY_VERSION:-}
+      REUNIFICATION_PREVIOUS_LOOKUP_SECRET_B64URL: ${REUNIFICATION_PREVIOUS_LOOKUP_SECRET_B64URL:-}
+      REUNIFICATION_REQUEST_TTL_DAYS: ${REUNIFICATION_REQUEST_TTL_DAYS:-14}
+      ALLOW_LEGACY_COMMAND_TOKEN: ${ALLOW_LEGACY_COMMAND_TOKEN:-false}
       COMMAND_CENTER_TOKEN: ${COMMAND_CENTER_TOKEN:?COMMAND_CENTER_TOKEN required}
       FEATURE_PUBLIC_SOS: ${FEATURE_PUBLIC_SOS:-true}
       FEATURE_OPERATIONAL_CENTER: ${FEATURE_OPERATIONAL_CENTER:-true}
@@ -152,13 +180,18 @@ services:
       FEATURE_WEBRTC_RELAY: ${FEATURE_WEBRTC_RELAY:-false}
       FEATURE_OPERATIONAL_LAYERS: ${FEATURE_OPERATIONAL_LAYERS:-false}
       FEATURE_SECURE_ENVELOPE: ${FEATURE_SECURE_ENVELOPE:-false}
+      FEATURE_REUNIFICATION: ${FEATURE_REUNIFICATION:-false}
       COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
       COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+    volumes:
+      - sync_keys:/run/sos-sync-keys:ro
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      sync-key-init:
+        condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
       evidence-scanner:
@@ -172,12 +205,16 @@ services:
 
   web:
     build:
-      context: ../../apps/web
+      context: ../..
+      dockerfile: apps/web/Dockerfile
       args:
         NEXT_PUBLIC_API_URL: /api/v1
         NEXT_PUBLIC_FEATURE_OFFLINE_QUEUE: ${NEXT_PUBLIC_FEATURE_OFFLINE_QUEUE:-false}
+        NEXT_PUBLIC_FEATURE_SECURE_ENVELOPE: ${NEXT_PUBLIC_FEATURE_SECURE_ENVELOPE:-false}
+        NEXT_PUBLIC_FEATURE_WEBRTC_RELAY: ${NEXT_PUBLIC_FEATURE_WEBRTC_RELAY:-false}
         NEXT_PUBLIC_FEATURE_LIVENESS: ${NEXT_PUBLIC_FEATURE_LIVENESS:-false}
         NEXT_PUBLIC_LIVENESS_PROVIDER: ${NEXT_PUBLIC_LIVENESS_PROVIDER:-MANUAL}
+        NEXT_PUBLIC_FEATURE_REUNIFICATION: ${NEXT_PUBLIC_FEATURE_REUNIFICATION:-false}
         NEXT_PUBLIC_MAP_STYLE_URL: ${NEXT_PUBLIC_MAP_STYLE_URL:-https://demotiles.maplibre.org/style.json}
     restart: unless-stopped
     depends_on:
@@ -214,5 +251,6 @@ volumes:
   redisdata:
   miniodata:
   clamavdata:
+  sync_keys:
   caddy_data:
   caddy_config:

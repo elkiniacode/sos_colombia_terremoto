@@ -123,7 +123,8 @@ resource "aws_iam_role_policy" "ecs_execution_secrets" {
         Action = ["secretsmanager:GetSecretValue"]
         Resource = [
           aws_db_instance.postgres.master_user_secret[0].secret_arn,
-          aws_secretsmanager_secret.identity_hash.arn
+          aws_secretsmanager_secret.identity_hash.arn,
+          aws_secretsmanager_secret.reunification_lookup.arn
         ]
       },
       {
@@ -171,6 +172,16 @@ resource "aws_iam_role_policy" "ecs_task" {
         Effect   = "Allow"
         Action   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey"]
         Resource = [aws_kms_key.data.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:GetPublicKey"]
+        Resource = [aws_kms_key.sync_encryption.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Sign", "kms:GetPublicKey"]
+        Resource = [aws_kms_key.sync_receipt_signing.arn]
       },
       {
         Effect   = "Allow"
@@ -239,6 +250,17 @@ resource "aws_ecs_task_definition" "api" {
       { name = "LIVENESS_PROVIDER", value = upper(var.liveness_provider) },
       { name = "LIVENESS_CLIENT_ROLE_ARN", value = aws_iam_role.liveness_client.arn },
       { name = "LIVENESS_MAX_ATTEMPTS_PER_24H", value = tostring(var.liveness_max_attempts_per_24h) },
+      { name = "SYNC_KEY_MODE", value = "AWS_KMS" },
+      { name = "SYNC_ENCRYPTION_KMS_KEY_ID", value = aws_kms_key.sync_encryption.arn },
+      { name = "SYNC_RECEIPT_SIGNING_KMS_KEY_ID", value = aws_kms_key.sync_receipt_signing.arn },
+      { name = "SYNC_ENCRYPTION_KEY_PUBLIC_ID", value = "sync-encryption-v1" },
+      { name = "SYNC_RECEIPT_SIGNING_KEY_PUBLIC_ID", value = "sync-receipt-v1" },
+      { name = "SYNC_MAX_ENVELOPE_TTL_SECONDS", value = tostring(var.sync_max_envelope_ttl_seconds) },
+      { name = "SYNC_MAX_CIPHERTEXT_BYTES", value = tostring(var.sync_max_ciphertext_bytes) },
+      { name = "SYNC_MAX_BATCH_SIZE", value = tostring(var.sync_max_batch_size) },
+      { name = "SYNC_BATCH_REQUESTS_PER_MINUTE", value = tostring(var.sync_batch_requests_per_minute) },
+      { name = "REUNIFICATION_LOOKUP_KEY_VERSION", value = tostring(var.reunification_lookup_key_version) },
+      { name = "REUNIFICATION_REQUEST_TTL_DAYS", value = tostring(var.reunification_request_ttl_days) },
       { name = "JOBS_QUEUE_URL", value = aws_sqs_queue.jobs.url },
       { name = "WEB_ORIGIN", value = var.domain_name != "" ? "https://${var.domain_name}" : "" },
       { name = "ALLOW_LEGACY_COMMAND_TOKEN", value = "false" },
@@ -248,21 +270,30 @@ resource "aws_ecs_task_definition" "api" {
       { name = "FEATURE_LIVENESS", value = tostring(var.feature_liveness) },
       { name = "FEATURE_ASSISTANCE_MATCHING", value = tostring(var.feature_assistance_matching) },
       { name = "FEATURE_WHATSAPP", value = tostring(var.feature_whatsapp) },
-      { name = "FEATURE_WEBRTC_RELAY", value = "false" },
+      { name = "FEATURE_WEBRTC_RELAY", value = tostring(var.feature_webrtc_relay) },
       { name = "FEATURE_OPERATIONAL_LAYERS", value = tostring(var.feature_operational_layers) },
-      { name = "FEATURE_SECURE_ENVELOPE", value = tostring(var.feature_secure_envelope) }
+      { name = "FEATURE_SECURE_ENVELOPE", value = tostring(var.feature_secure_envelope) },
+      { name = "FEATURE_REUNIFICATION", value = tostring(var.feature_reunification) }
     ]
 
-    secrets = [
-      {
-        name      = "DB_PASSWORD"
-        valueFrom = "${aws_db_instance.postgres.master_user_secret[0].secret_arn}:password::"
-      },
-      {
-        name      = "IDENTITY_HASH_SECRET"
-        valueFrom = aws_secretsmanager_secret.identity_hash.arn
-      }
-    ]
+    secrets = concat(
+      [
+        {
+          name      = "DB_PASSWORD"
+          valueFrom = "${aws_db_instance.postgres.master_user_secret[0].secret_arn}:password::"
+        },
+        {
+          name      = "IDENTITY_HASH_SECRET"
+          valueFrom = aws_secretsmanager_secret.identity_hash.arn
+        }
+      ],
+      var.feature_reunification ? [
+        {
+          name      = "REUNIFICATION_LOOKUP_SECRET_B64URL"
+          valueFrom = aws_secretsmanager_secret.reunification_lookup.arn
+        }
+      ] : []
+    )
 
     logConfiguration = {
       logDriver = "awslogs"

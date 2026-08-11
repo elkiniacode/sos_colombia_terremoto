@@ -37,10 +37,10 @@ El adapter OTP actual usa Amazon Cognito. Por eso el perfil on-prem mantiene por
 ```text
 FEATURE_AFFECTED_IDENTITY=false
 FEATURE_LIVENESS=false
-ALLOW_LEGACY_COMMAND_TOKEN=true
+ALLOW_LEGACY_COMMAND_TOKEN=false
 ```
 
-`ALLOW_LEGACY_COMMAND_TOKEN=true` es únicamente bootstrap/laboratorio. **No es autenticación institucional production-ready.** Para una instalación 100% autónoma sin AWS debe integrarse un proveedor OTP institucional y desactivarse el token legacy.
+`ALLOW_LEGACY_COMMAND_TOKEN` debe quedar en `false`. Solo se activa en `true` de forma temporal y controlada (ventana corta, red de confianza) para la primera carga de funcionarios vía `POST /api/v1/officials/import`; hecho esto, se vuelve a `false` y se rota `COMMAND_CENTER_TOKEN`. **No es autenticación institucional production-ready.** Para una instalación 100% autónoma sin AWS debe integrarse un proveedor OTP institucional.
 
 El reporte SOS de emergencia no depende de este registro de identidad.
 

@@ -13,3 +13,5 @@
 11. Toda lectura/descarga de evidencia sensible debe generar auditoría.
 
 La entidad pública operadora debe revisar con su responsable jurídico y de protección de datos la base legal, política de tratamiento, autorización, transferencias y retención antes de operar a escala.
+
+Punto de partida para ese aviso: [`docs/legal/PRIVACY_NOTICE.md`](legal/PRIVACY_NOTICE.md) — borrador técnico, no vigente hasta aprobación jurídica.
