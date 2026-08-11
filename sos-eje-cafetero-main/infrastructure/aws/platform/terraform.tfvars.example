@@ -1,0 +1,59 @@
+project_name = "sos-eje-cafetero"
+environment  = "prod"
+aws_region   = "us-east-1"
+
+# Imagen publicada por scripts/02-build-push-api.sh
+api_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/sos-eje-cafetero/api:REPLACE_SHA"
+
+# Producción: NAT por AZ. Para un piloto de bajo costo puede usarse true temporalmente.
+single_nat_gateway = false
+
+api_desired_count = 2
+api_min_count     = 2
+api_max_count     = 10
+
+db_instance_class        = "db.t4g.medium"
+db_allocated_storage     = 100
+db_max_allocated_storage = 500
+db_backup_retention_days = 14
+deletion_protection      = true
+
+redis_node_type = "cache.t4g.small"
+
+# Dominio opcional. Si ambos quedan vacíos, CloudFront entrega un dominio propio.
+domain_name     = ""
+route53_zone_id = ""
+
+alarm_email = ""
+
+# Evidencia sensible. En producción reemplazar * por el dominio exacto.
+evidence_cors_origins               = ["*"]
+evidence_retention_days             = 90
+enable_guardduty_malware_protection = true
+require_malware_scan                = true
+
+# Liveness es una señal antifraude, nunca la decisión final de ayuda.
+liveness_provider             = "REKOGNITION"
+liveness_max_attempts_per_24h = 3
+
+# SecureEnvelope. Mensajes estructurados pequeños: no fotos/videos en relay V1.
+sync_max_envelope_ttl_seconds  = 259200
+sync_max_ciphertext_bytes      = 12288
+sync_max_batch_size            = 4
+# Límite suplementario por emitterKeyId, no por IP; evita castigar carrier NAT compartido.
+sync_batch_requests_per_minute = 60
+
+# Reencuentro: Terraform NO recibe el valor secreto HMAC. Primero aplicar con feature=false,
+# cargar el valor directamente en Secrets Manager y solo después activar la feature.
+reunification_lookup_key_version = 1
+reunification_request_ttl_days    = 14
+
+# Safe mode: habilitar una capacidad solo después de superar su gate.
+feature_affected_identity   = false
+feature_liveness            = false
+feature_assistance_matching = false
+feature_whatsapp            = false
+feature_operational_layers  = false
+feature_secure_envelope     = false
+feature_webrtc_relay        = false
+feature_reunification       = false

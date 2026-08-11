@@ -1,0 +1,251 @@
+name: sos-eje-cafetero
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sos}
+      POSTGRES_USER: ${POSTGRES_USER:-sos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sos} -d ${POSTGRES_DB:-sos}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [backend]
+
+  sync-key-init:
+    image: node:22-alpine
+    restart: "no"
+    command: ["node", "/init/generate-sync-keys.mjs"]
+    volumes:
+      - ./scripts/generate-sync-keys.mjs:/init/generate-sync-keys.mjs:ro
+      - sync_keys:/keys
+    networks: [backend]
+
+  minio:
+    image: ${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-06T17-38-46Z}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER required}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD required}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [backend]
+
+  minio-init:
+    image: ${MINIO_MC_IMAGE:-minio/mc:RELEASE.2025-07-21T05-28-08Z}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >-
+      /bin/sh -c '
+      set -eu;
+      mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}";
+      mc mb --ignore-existing local/$${PRIVATE_EVIDENCE_BUCKET};
+      mc anonymous set none local/$${PRIVATE_EVIDENCE_BUCKET};
+      mc version enable local/$${PRIVATE_EVIDENCE_BUCKET};
+      sed "s/__BUCKET__/$${PRIVATE_EVIDENCE_BUCKET}/g" /policies/sos-api.json > /tmp/sos-api.json;
+      sed "s/__BUCKET__/$${PRIVATE_EVIDENCE_BUCKET}/g" /policies/evidence-scanner.json > /tmp/evidence-scanner.json;
+      sed "s/__RETENTION_DAYS__/$${EVIDENCE_RETENTION_DAYS}/g" /policies/evidence-lifecycle.json > /tmp/evidence-lifecycle.json;
+      mc admin user rm local "$${S3_API_ACCESS_KEY}" >/dev/null 2>&1 || true;
+      mc admin user rm local "$${S3_SCANNER_ACCESS_KEY}" >/dev/null 2>&1 || true;
+      mc admin policy rm local sos-api >/dev/null 2>&1 || true;
+      mc admin policy rm local sos-evidence-scanner >/dev/null 2>&1 || true;
+      mc admin user add local "$${S3_API_ACCESS_KEY}" "$${S3_API_SECRET_KEY}";
+      mc admin user add local "$${S3_SCANNER_ACCESS_KEY}" "$${S3_SCANNER_SECRET_KEY}";
+      mc admin policy create local sos-api /tmp/sos-api.json;
+      mc admin policy create local sos-evidence-scanner /tmp/evidence-scanner.json;
+      mc admin policy attach local sos-api --user "$${S3_API_ACCESS_KEY}";
+      mc admin policy attach local sos-evidence-scanner --user "$${S3_SCANNER_ACCESS_KEY}";
+      mc ilm rule import local/$${PRIVATE_EVIDENCE_BUCKET} < /tmp/evidence-lifecycle.json;
+      exit 0'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      PRIVATE_EVIDENCE_BUCKET: ${PRIVATE_EVIDENCE_BUCKET:-sos-private-evidence}
+      EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-90}
+      S3_API_ACCESS_KEY: ${S3_API_ACCESS_KEY:?S3_API_ACCESS_KEY required}
+      S3_API_SECRET_KEY: ${S3_API_SECRET_KEY:?S3_API_SECRET_KEY required}
+      S3_SCANNER_ACCESS_KEY: ${S3_SCANNER_ACCESS_KEY:?S3_SCANNER_ACCESS_KEY required}
+      S3_SCANNER_SECRET_KEY: ${S3_SCANNER_SECRET_KEY:?S3_SCANNER_SECRET_KEY required}
+    volumes:
+      - ./policies:/policies:ro
+    networks: [backend]
+
+  clamav:
+    image: ${CLAMAV_IMAGE:-clamav/clamav:1.5.3-debian13-slim}
+    restart: unless-stopped
+    volumes:
+      - clamavdata:/var/lib/clamav
+    networks: [backend]
+
+  evidence-scanner:
+    build:
+      context: ./evidence-scanner
+    restart: unless-stopped
+    environment:
+      S3_ENDPOINT: http://minio:9000
+      S3_SCANNER_ACCESS_KEY: ${S3_SCANNER_ACCESS_KEY:?S3_SCANNER_ACCESS_KEY required}
+      S3_SCANNER_SECRET_KEY: ${S3_SCANNER_SECRET_KEY:?S3_SCANNER_SECRET_KEY required}
+      PRIVATE_EVIDENCE_BUCKET: ${PRIVATE_EVIDENCE_BUCKET:-sos-private-evidence}
+      EVIDENCE_SCAN_PREFIX: private/affected/
+      EVIDENCE_SCAN_POLL_SECONDS: ${EVIDENCE_SCAN_POLL_SECONDS:-2}
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      clamav:
+        condition: service_started
+    networks: [backend]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-sos}
+      DB_USER: ${POSTGRES_USER:-sos}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_SSL: "false"
+      REDIS_URL: redis://redis:6379
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_ENDPOINT: http://minio:9000
+      S3_FORCE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: ${S3_API_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_API_SECRET_KEY}
+      PRIVATE_EVIDENCE_BUCKET: ${PRIVATE_EVIDENCE_BUCKET:-sos-private-evidence}
+      EVIDENCE_RETENTION_DAYS: ${EVIDENCE_RETENTION_DAYS:-90}
+      EVIDENCE_MALWARE_SCAN_MODE: TAGGED_S3
+      REQUIRE_MALWARE_SCAN: ${REQUIRE_MALWARE_SCAN:-true}
+      IDENTITY_HASH_SECRET: ${IDENTITY_HASH_SECRET:?IDENTITY_HASH_SECRET required}
+      LIVENESS_PROVIDER: ${LIVENESS_PROVIDER:-MANUAL}
+      LIVENESS_MAX_ATTEMPTS_PER_24H: ${LIVENESS_MAX_ATTEMPTS_PER_24H:-3}
+      SYNC_KEY_MODE: LOCAL_PEM
+      SYNC_ENCRYPTION_PRIVATE_KEY_PATH: /run/sos-sync-keys/sync-encryption-private.pem
+      SYNC_RECEIPT_SIGNING_PRIVATE_KEY_PATH: /run/sos-sync-keys/sync-receipt-signing-private.pem
+      SYNC_ENCRYPTION_KEY_PUBLIC_ID: ${SYNC_ENCRYPTION_KEY_PUBLIC_ID:-sync-encryption-v1}
+      SYNC_RECEIPT_SIGNING_KEY_PUBLIC_ID: ${SYNC_RECEIPT_SIGNING_KEY_PUBLIC_ID:-sync-receipt-v1}
+      SYNC_MAX_ENVELOPE_TTL_SECONDS: ${SYNC_MAX_ENVELOPE_TTL_SECONDS:-259200}
+      SYNC_MAX_CIPHERTEXT_BYTES: ${SYNC_MAX_CIPHERTEXT_BYTES:-12288}
+      SYNC_MAX_BATCH_SIZE: ${SYNC_MAX_BATCH_SIZE:-4}
+      SYNC_BATCH_REQUESTS_PER_MINUTE: ${SYNC_BATCH_REQUESTS_PER_MINUTE:-30}
+      REUNIFICATION_LOOKUP_KEY_VERSION: ${REUNIFICATION_LOOKUP_KEY_VERSION:-1}
+      REUNIFICATION_LOOKUP_SECRET_B64URL: ${REUNIFICATION_LOOKUP_SECRET_B64URL:-}
+      REUNIFICATION_PREVIOUS_LOOKUP_KEY_VERSION: ${REUNIFICATION_PREVIOUS_LOOKUP_KEY_VERSION:-}
+      REUNIFICATION_PREVIOUS_LOOKUP_SECRET_B64URL: ${REUNIFICATION_PREVIOUS_LOOKUP_SECRET_B64URL:-}
+      REUNIFICATION_REQUEST_TTL_DAYS: ${REUNIFICATION_REQUEST_TTL_DAYS:-14}
+      ALLOW_LEGACY_COMMAND_TOKEN: ${ALLOW_LEGACY_COMMAND_TOKEN:-true}
+      COMMAND_CENTER_TOKEN: ${COMMAND_CENTER_TOKEN:?COMMAND_CENTER_TOKEN required}
+      FEATURE_PUBLIC_SOS: ${FEATURE_PUBLIC_SOS:-true}
+      FEATURE_OPERATIONAL_CENTER: ${FEATURE_OPERATIONAL_CENTER:-true}
+      FEATURE_AFFECTED_IDENTITY: ${FEATURE_AFFECTED_IDENTITY:-false}
+      FEATURE_LIVENESS: ${FEATURE_LIVENESS:-false}
+      FEATURE_ASSISTANCE_MATCHING: ${FEATURE_ASSISTANCE_MATCHING:-false}
+      FEATURE_WHATSAPP: ${FEATURE_WHATSAPP:-false}
+      FEATURE_WEBRTC_RELAY: ${FEATURE_WEBRTC_RELAY:-false}
+      FEATURE_OPERATIONAL_LAYERS: ${FEATURE_OPERATIONAL_LAYERS:-false}
+      FEATURE_SECURE_ENVELOPE: ${FEATURE_SECURE_ENVELOPE:-false}
+      FEATURE_REUNIFICATION: ${FEATURE_REUNIFICATION:-false}
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:-}
+    volumes:
+      - sync_keys:/run/sos-sync-keys:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sync-key-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      evidence-scanner:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks: [backend, edge]
+
+  web:
+    build:
+      context: ../..
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: /api/v1
+        NEXT_PUBLIC_FEATURE_OFFLINE_QUEUE: ${NEXT_PUBLIC_FEATURE_OFFLINE_QUEUE:-false}
+        NEXT_PUBLIC_FEATURE_SECURE_ENVELOPE: ${NEXT_PUBLIC_FEATURE_SECURE_ENVELOPE:-false}
+        NEXT_PUBLIC_FEATURE_WEBRTC_RELAY: ${NEXT_PUBLIC_FEATURE_WEBRTC_RELAY:-false}
+        NEXT_PUBLIC_FEATURE_LIVENESS: ${NEXT_PUBLIC_FEATURE_LIVENESS:-false}
+        NEXT_PUBLIC_LIVENESS_PROVIDER: ${NEXT_PUBLIC_LIVENESS_PROVIDER:-MANUAL}
+        NEXT_PUBLIC_FEATURE_REUNIFICATION: ${NEXT_PUBLIC_FEATURE_REUNIFICATION:-false}
+        NEXT_PUBLIC_MAP_STYLE_URL: ${NEXT_PUBLIC_MAP_STYLE_URL:-https://demotiles.maplibre.org/style.json}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [edge]
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost}
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_started
+      api:
+        condition: service_healthy
+    networks: [edge]
+
+networks:
+  backend:
+    internal: true
+  edge:
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  clamavdata:
+  sync_keys:
+  caddy_data:
+  caddy_config:
